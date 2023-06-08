@@ -29,3 +29,10 @@ Epochs 500:
 Epochs 600: 
 
 ![epoch0](https://github.com/cjaitej/Face-Generation-using-Diffusion-Model/blob/main/Results/600.jpg)
+
+
+FINAL RESULTS:
+
+![final1](https://github.com/cjaitej/Face-Generation-using-Diffusion-Model/blob/main/Results/1.jpg)
+![final1](https://github.com/cjaitej/Face-Generation-using-Diffusion-Model/blob/main/Results/2.jpg)
+
