@@ -33,6 +33,4 @@ Epochs 600:
 
 FINAL RESULTS:
 
-![final1](https://github.com/cjaitej/Face-Generation-using-Diffusion-Model/blob/main/Results/1.jpg)
 ![final1](https://github.com/cjaitej/Face-Generation-using-Diffusion-Model/blob/main/Results/2.jpg)
-
