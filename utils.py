@@ -6,7 +6,7 @@ import torch.nn as nn
 import torchvision
 from PIL import Image
 from matplotlib import pyplot as plt
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from dataset import FaceDataset
 
 
@@ -43,10 +43,23 @@ def get_data(args):
         steps.insert(-2, torchvision.transforms.RandomHorizontalFlip())
     transforms = torchvision.transforms.Compose(steps)
     dataset = FaceDataset(args.dataset_path, transforms, attr_file=getattr(args, 'attr_file', None))
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                            num_workers=getattr(args, 'num_workers', 0),
-                            pin_memory=getattr(args, 'pin_memory', False),
-                            drop_last=True)
+
+    samples_per_epoch = getattr(args, 'samples_per_epoch', None)
+    if samples_per_epoch and samples_per_epoch < len(dataset):
+        # RandomSampler re-permutes on every __iter__ (i.e. every epoch, since DataLoader creates
+        # a fresh iterator each time), so this draws a *different* random subset each epoch rather
+        # than shuffling the same fixed slice forever. Caps per-epoch compute at samples_per_epoch
+        # while still covering the full dataset given enough epochs.
+        sampler = RandomSampler(dataset, replacement=False, num_samples=samples_per_epoch)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                                num_workers=getattr(args, 'num_workers', 0),
+                                pin_memory=getattr(args, 'pin_memory', False),
+                                drop_last=True)
+    else:
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                                num_workers=getattr(args, 'num_workers', 0),
+                                pin_memory=getattr(args, 'pin_memory', False),
+                                drop_last=True)
     return dataloader
 
 

@@ -129,6 +129,7 @@ if __name__ == "__main__":
     args.num_workers = 4
     args.pin_memory = torch.cuda.is_available()
     args.dataset_path = "data_set.txt"
+    args.samples_per_epoch = None  # e.g. 60000: cap per-epoch batches, redrawn randomly each epoch
     args.attr_file = "list_attr_celeba.csv"  # set to None to train the original unconditional model
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     args.lr = 1e-4
