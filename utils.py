@@ -1,5 +1,6 @@
 import os
 import copy
+import itertools
 import torch
 import torch.nn as nn
 import torchvision
@@ -77,20 +78,44 @@ class EMA:
                 value.copy_(source[key])
 
 
+def _iter_image_paths(folder, extensions):
+    """Yield image paths lazily.
+
+    Deliberately not os.walk: that builds the complete file list for a directory before yielding
+    anything, so on CelebA it enumerates all 202k entries even when the caller only wants a few.
+    On a network-backed filesystem (e.g. Kaggle's /kaggle/input) that is painfully slow. scandir
+    streams entries instead, letting `limit` stop early. Order is filesystem order, not sorted.
+    """
+    stack = [folder]
+    while stack:
+        subdirs = []
+        with os.scandir(stack.pop()) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name.lower().endswith(extensions):
+                    yield entry.path
+                elif entry.is_dir():
+                    subdirs.append(entry.path)
+        stack.extend(subdirs)
+
+
 def create_data_list(folder, output_file='data_set.txt', extensions=('.jpg', '.jpeg', '.png'),
-                     limit=None):
+                     limit=None, progress_every=25000):
     """Write one image path per line. `limit` caps the number of images, which is useful when
-    compute is the binding constraint and more passes over less data beats one pass over all."""
+    compute is the binding constraint and more passes over less data beats one pass over all.
+
+    Scanning 200k files on a network filesystem takes a while; `progress_every` prints as it goes
+    so a slow scan is distinguishable from a hung one.
+    """
+    paths = _iter_image_paths(folder, extensions)
+    if limit is not None:
+        paths = itertools.islice(paths, limit)
     count = 0
     with open(output_file, 'w') as f:
-        for root, _, files in os.walk(folder):
-            for name in sorted(files):
-                if not name.lower().endswith(extensions):
-                    continue
-                f.write(os.path.join(root, name) + '\n')
-                count += 1
-                if limit is not None and count >= limit:
-                    return count
+        for path in paths:
+            f.write(path + '\n')
+            count += 1
+            if progress_every and count % progress_every == 0:
+                print(f'  ...{count} images found', flush=True)
     return count
 
 
