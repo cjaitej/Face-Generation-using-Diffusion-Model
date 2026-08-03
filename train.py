@@ -4,6 +4,7 @@ from model import Diffusion, UNet
 import torch.optim as optim
 import torch.nn as nn
 import argparse
+from tqdm import tqdm
 from utils import *
 from dataset import SELECTED_ATTRIBUTES, EVAL_ATTRIBUTE_SETS, build_attribute_batch
 
@@ -76,9 +77,9 @@ def train(args):
         n_eval = len(EVAL_ATTRIBUTE_SETS)
 
     for epoch in range(start_epoch, args.epochs):
-        print(f"Starting epoch {epoch}:")
         running_loss = 0.0
-        for i, batch in enumerate(dataloader):
+        pbar = tqdm(dataloader, desc=f"epoch {epoch}/{args.epochs - 1}", dynamic_ncols=True)
+        for i, batch in enumerate(pbar):
             if num_attributes:
                 images, attributes = batch
                 attributes = attributes.to(device)
@@ -100,10 +101,10 @@ def train(args):
                 ema.update(model)
 
             running_loss += loss.item()
-            if i % 10 == 0:
-                print("=", end="")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{running_loss / (i + 1):.4f}")
 
-        print(f"\nepoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
+        pbar.close()
+        print(f"epoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
 
         if epoch % sample_every == 0:
             sampling_model = ema.ema_model if ema is not None else unwrap(model)
@@ -111,7 +112,7 @@ def train(args):
                                               seed=sample_seed, guidance_scale=guidance_scale)
             sample_path = os.path.join("results", args.run_name, f"epoch_{epoch:04d}.jpg")
             save_images(sampled_images, sample_path)
-            print(f"\nSaved samples to {sample_path}")
+            print(f"Saved samples to {sample_path}")
         save_checkpoint(epoch, model, optimizer, filename=checkpoint_path, ema=ema,
                         image_size=args.image_size, schedule=getattr(args, 'schedule', 'cosine'))
 

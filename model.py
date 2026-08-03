@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from tqdm import tqdm
 
 
 def norm_layer(channels):
@@ -257,7 +258,6 @@ class Diffusion:
         stay directly comparable. `guidance_scale` > 1 applies classifier-free guidance, pushing
         samples further towards the requested attributes (typical range 1.5-5).
         """
-        print(f"Sampling {n} new images....")
         model.eval()
         if attributes is not None:
             attributes = attributes.to(self.device)
@@ -269,7 +269,8 @@ class Diffusion:
 
         with torch.no_grad():
             x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device, generator=generator)
-            for i in reversed(range(1, self.noise_steps)):
+            for i in tqdm(reversed(range(1, self.noise_steps)), total=self.noise_steps - 1,
+                          desc=f"sampling {n} images", dynamic_ncols=True, leave=False):
                 t = (torch.ones(n) * i).long().to(self.device)
                 if use_guidance:
                     predicted_noise = model(x, t, attributes)
@@ -285,8 +286,6 @@ class Diffusion:
                 else:
                     noise = torch.zeros_like(x)
                 x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-                if i % 100 == 0:
-                    print("=", end="")
         model.train()
         x = (x.clamp(-1, 1) + 1) / 2
         x = (x * 255).type(torch.uint8)
