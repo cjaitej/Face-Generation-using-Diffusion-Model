@@ -58,6 +58,18 @@ def load_attributes(attr_file, selected_attributes=SELECTED_ATTRIBUTES):
     return attributes
 
 
+def list_celeba_filenames(attr_file):
+    """Read just the filenames (column 0) out of list_attr_celeba.csv.
+
+    The attribute file already enumerates every image in the dataset, so this is the list of
+    all image filenames for free -- no need to scan the (possibly network-backed) image directory.
+    """
+    with open(attr_file, 'r', newline='') as f:
+        reader = csv.reader(f)
+        next(reader)  # header
+        return [row[0] for row in reader if row]
+
+
 class FaceDataset(Dataset):
     def __init__(self, data_folder, transform, attr_file=None):
         self.transform = transform
