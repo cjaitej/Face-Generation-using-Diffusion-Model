@@ -50,6 +50,50 @@ class ResBlock(nn.Module):
         return h + self.skip(x)
 
 
+class BottleneckResBlock(nn.Module):
+    """Pre-activation residual block, ResNet-v2 bottleneck style: squeeze to a narrow channel
+    count, do the 3x3 spatial mixing there, then expand back out.
+
+    A plain 3x3-then-3x3 ResBlock's cost scales with out_c^2, which is fine at 32-64 channels
+    but dominates the parameter budget once channels reach the hundreds (e.g. a 1024-channel
+    block is ~85% of the whole UNet). Squeezing to out_c/reduction before the 3x3 keeps the
+    1x1 projections at full width (so skip connections and channel-mixing capacity are
+    unchanged) while cutting the expensive conv's cost by roughly reduction^2.
+    """
+
+    def __init__(self, in_c, out_c, time_emb_dim, dropout=0.0, reduction=4):
+        super().__init__()
+        mid_c = max(out_c // reduction, 32)
+        self.norm1 = norm_layer(in_c)
+        self.reduce = nn.Conv2d(in_c, mid_c, kernel_size=1)
+        self.norm_mid1 = norm_layer(mid_c)
+        self.conv3x3 = nn.Conv2d(mid_c, mid_c, kernel_size=3, padding=1)
+        self.time_mlp = nn.Linear(time_emb_dim, mid_c)
+        self.norm_mid2 = norm_layer(mid_c)
+        self.dropout = nn.Dropout(dropout)
+        self.expand = nn.Conv2d(mid_c, out_c, kernel_size=1)
+        self.skip = nn.Conv2d(in_c, out_c, kernel_size=1) if in_c != out_c else nn.Identity()
+        self.activation = nn.SiLU()
+
+    def forward(self, x, t):
+        h = self.reduce(self.activation(self.norm1(x)))
+        h = self.conv3x3(self.activation(self.norm_mid1(h)))
+        h = h + self.time_mlp(self.activation(t))[(..., ) + (None, ) * 2]
+        h = self.expand(self.dropout(self.activation(self.norm_mid2(h))))
+        return h + self.skip(x)
+
+
+# Below this channel count a plain ResBlock is already cheap; at and above it the wide 3x3s
+# dominate the parameter budget, so the bottleneck design is worth the extra 1x1s.
+BOTTLENECK_CHANNEL_THRESHOLD = 128
+
+
+def make_res_block(in_c, out_c, time_emb_dim, dropout=0.0, reduction=4):
+    if out_c >= BOTTLENECK_CHANNEL_THRESHOLD:
+        return BottleneckResBlock(in_c, out_c, time_emb_dim, dropout, reduction=reduction)
+    return ResBlock(in_c, out_c, time_emb_dim, dropout)
+
+
 class Attention(nn.Module):
     """Vectorized spatial self-attention over the H*W positions."""
 
@@ -91,7 +135,7 @@ class Upsample(nn.Module):
 class EncoderLevel(nn.Module):
     def __init__(self, in_c, out_c, time_emb_dim, use_attention, dropout=0.0):
         super().__init__()
-        self.res_block = ResBlock(in_c, out_c, time_emb_dim, dropout)
+        self.res_block = make_res_block(in_c, out_c, time_emb_dim, dropout)
         self.use_attention = use_attention
         if use_attention:
             self.attention = Attention(out_c)
@@ -108,7 +152,7 @@ class DecoderLevel(nn.Module):
     def __init__(self, in_c, out_c, time_emb_dim, use_attention, dropout=0.0):
         super().__init__()
         self.up = Upsample(in_c, out_c)
-        self.res_block = ResBlock(out_c * 2, out_c, time_emb_dim, dropout)
+        self.res_block = make_res_block(out_c * 2, out_c, time_emb_dim, dropout)
         self.use_attention = use_attention
         if use_attention:
             self.attention = Attention(out_c)
@@ -150,9 +194,9 @@ class UNet(nn.Module):
         ])
 
         bottleneck_c = self.channels[-1] * 2
-        self.bottleneck_in = ResBlock(self.channels[-1], bottleneck_c, time_emb_dim, dropout)
+        self.bottleneck_in = make_res_block(self.channels[-1], bottleneck_c, time_emb_dim, dropout)
         self.bottleneck_attention = Attention(bottleneck_c)
-        self.bottleneck_out = ResBlock(bottleneck_c, bottleneck_c, time_emb_dim, dropout)
+        self.bottleneck_out = make_res_block(bottleneck_c, bottleneck_c, time_emb_dim, dropout)
 
         dec_out = self.channels[::-1]
         dec_in = [bottleneck_c] + dec_out[:-1]
