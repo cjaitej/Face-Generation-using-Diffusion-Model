@@ -1,8 +1,17 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
-device = torch.device('cuda')
+
+def norm_layer(channels):
+    """GroupNorm with a sensible group count (~4 channels per group, capped at 32 groups).
+    Falls back to a divisor of `channels` so the layer is always constructible."""
+    groups = min(32, max(1, channels // 4))
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
+
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -12,141 +21,225 @@ class SinusoidalPositionEmbeddings(nn.Module):
     def forward(self, time):
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = torch.exp(torch.arange(half_dim, device=time.device) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
 
-class conv_block(nn.Module):
-    def __init__(self, in_c, out_c):
-        super(conv_block, self).__init__()
-        time_emb_dim = 32
+class ResBlock(nn.Module):
+    """Pre-activation residual block with the timestep/attribute embedding injected between
+    the two convolutions (standard DDPM placement)."""
+
+    def __init__(self, in_c, out_c, time_emb_dim, dropout=0.0):
+        super().__init__()
+        self.norm1 = norm_layer(in_c)
         self.conv1 = nn.Conv2d(in_c, out_c, kernel_size=3, padding=1)
+        self.time_mlp = nn.Linear(time_emb_dim, out_c)
+        self.norm2 = norm_layer(out_c)
+        self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(out_c, out_c, kernel_size=3, padding=1)
-        self.time_mlp =  nn.Linear(time_emb_dim, out_c)
-        self.norm1 = nn.BatchNorm2d(out_c)
-        self.norm2 = nn.BatchNorm2d(out_c)
-        self.activation = nn.ReLU()
-
-    def forward(self, x, time_emb):
-        x = y = self.conv1(x)
-        x = self.norm1(self.conv2(x))
-        x = self.activation(x)
-        x = self.norm2(self.conv3(x)) + y
-        x = self.activation(x)
-        time_emb = self.activation(self.time_mlp(time_emb))
-        x = x + time_emb[(..., ) + (None, ) * 2]
-        return x
-
-
-class Encoder(nn.Module):
-    def __init__(self, in_c, out_c):
-        super(Encoder, self).__init__()
-        self.conv_block = conv_block(in_c, out_c)
-        self.activation = nn.ReLU()
-        self.pool = nn.MaxPool2d(2)
+        self.skip = nn.Conv2d(in_c, out_c, kernel_size=1) if in_c != out_c else nn.Identity()
+        self.activation = nn.SiLU()
 
     def forward(self, x, t):
-        x = self.conv_block(x, t)
-        p = self.pool(x)
-        return p, x
+        h = self.conv1(self.activation(self.norm1(x)))
+        h = h + self.time_mlp(self.activation(t))[(..., ) + (None, ) * 2]
+        h = self.conv2(self.dropout(self.activation(self.norm2(h))))
+        return h + self.skip(x)
 
-
-class Decoder(nn.Module):
-    def __init__(self, in_c, out_c, mode=''):
-        super(Decoder, self).__init__()
-        self.transpose_layer = nn.ConvTranspose2d(in_c, out_c, kernel_size=2, stride=2)
-        self.conv_block = conv_block(out_c + out_c, out_c)
-        if mode == 'final_layer':
-            self.activation = nn.Sigmoid()
-        else:
-            self.activation = nn.ReLU()
-
-    def forward(self, input, skip, t):
-        x = self.transpose_layer(input)
-        x = torch.cat([x, skip], axis=1)
-        x = self.conv_block(x, t)
-        x = self.activation(x)
-        return x
 
 class Attention(nn.Module):
-    def __init__(self, dim, n_features, num_heads=1):
-        super(Attention, self).__init__()
-        self.attention = nn.MultiheadAttention(dim, num_heads=num_heads)
-        self.conv1 = nn.Conv2d(n_features, n_features, kernel_size=1)
-        self.conv2 = nn.Conv2d(n_features, n_features, kernel_size=1)
-        self.conv3 = nn.Conv2d(n_features, n_features, kernel_size=1)
+    """Vectorized spatial self-attention over the H*W positions."""
 
-    def forward(self, input):
-        output = torch.zeros_like(input)
-        for n, i in enumerate(input):
-            query = self.conv1(i)
-            key = self.conv2(i)
-            value = self.conv3(i)
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.norm = norm_layer(channels)
+        self.attention = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
 
-            output[n] = self.attention(query, key, value, need_weights=False)[0]
+    def forward(self, x):
+        b, c, h, w = x.shape
+        seq = self.norm(x).reshape(b, c, h * w).transpose(1, 2)  # (B, H*W, C)
+        attn_out, _ = self.attention(seq, seq, seq, need_weights=False)
+        return x + attn_out.transpose(1, 2).reshape(b, c, h, w)
 
-        return output
+
+class Downsample(nn.Module):
+    """Strided convolution; preserves more detail than max pooling."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.op = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.op(x)
+
+
+class Upsample(nn.Module):
+    """Nearest-neighbour upsample + conv, which avoids the checkerboard artifacts
+    that transposed convolutions produce."""
+
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.conv = nn.Conv2d(in_c, out_c, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        return self.conv(F.interpolate(x, scale_factor=2, mode='nearest'))
+
+
+class EncoderLevel(nn.Module):
+    def __init__(self, in_c, out_c, time_emb_dim, use_attention, dropout=0.0):
+        super().__init__()
+        self.res_block = ResBlock(in_c, out_c, time_emb_dim, dropout)
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = Attention(out_c)
+        self.down = Downsample(out_c)
+
+    def forward(self, x, t):
+        x = self.res_block(x, t)
+        if self.use_attention:
+            x = self.attention(x)
+        return self.down(x), x  # (downsampled, skip)
+
+
+class DecoderLevel(nn.Module):
+    def __init__(self, in_c, out_c, time_emb_dim, use_attention, dropout=0.0):
+        super().__init__()
+        self.up = Upsample(in_c, out_c)
+        self.res_block = ResBlock(out_c * 2, out_c, time_emb_dim, dropout)
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = Attention(out_c)
+
+    def forward(self, x, skip, t):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.res_block(x, t)
+        if self.use_attention:
+            x = self.attention(x)
+        return x
 
 
 class UNet(nn.Module):
-    def __init__(self, input_shape, output_shape):
+    """Conditional U-Net predicting the noise added at a given timestep.
+
+    Attributes are embedded and summed into the timestep embedding. A learned `null_cond`
+    token represents "no conditioning", which is what makes classifier-free guidance work:
+    during training some samples are randomly switched to it, and at sampling time the
+    conditional and unconditional predictions are extrapolated apart.
+    """
+
+    def __init__(self, input_shape, output_shape, num_attributes=0, time_emb_dim=256,
+                 attention_resolutions=(16, 8), dropout=0.0):
         super(UNet, self).__init__()
-        time_emb_dim = 32
-
         self.channels = [32, 64, 128, 256, 512]
+        self.num_attributes = num_attributes
 
-        self.dim = [input_shape[-1]//(2**i) for i in range(1, len(self.channels) + 1)]
+        img_size = input_shape[-1]
+        # Resolution each encoder level operates at, before its downsample.
+        enc_resolutions = [img_size // (2 ** i) for i in range(len(self.channels))]
 
-        self.encoder_list = nn.ModuleList([Encoder(input_shape[0], 32)] + [Encoder(in_c, in_c*2) for in_c in self.channels[:-1]])
+        self.stem = nn.Conv2d(input_shape[0], self.channels[0], kernel_size=3, padding=1)
 
-        self.attention_list = nn.ModuleList([Attention(dim, n_features, 1) for dim, n_features in zip(self.dim, self.channels)])
+        enc_in = [self.channels[0]] + self.channels[:-1]
+        self.encoder_list = nn.ModuleList([
+            EncoderLevel(i_c, o_c, time_emb_dim, res in attention_resolutions, dropout)
+            for i_c, o_c, res in zip(enc_in, self.channels, enc_resolutions)
+        ])
 
-        self.decoder_list = nn.ModuleList([Decoder(in_c*2, in_c) for in_c in self.channels[::-1][:-1]] + [Decoder(64, 32, mode='final_layer')])
+        bottleneck_c = self.channels[-1] * 2
+        self.bottleneck_in = ResBlock(self.channels[-1], bottleneck_c, time_emb_dim, dropout)
+        self.bottleneck_attention = Attention(bottleneck_c)
+        self.bottleneck_out = ResBlock(bottleneck_c, bottleneck_c, time_emb_dim, dropout)
 
-        self.bottle_neck = conv_block(512, 1024)
+        dec_out = self.channels[::-1]
+        dec_in = [bottleneck_c] + dec_out[:-1]
+        dec_resolutions = enc_resolutions[::-1]
+        self.decoder_list = nn.ModuleList([
+            DecoderLevel(i_c, o_c, time_emb_dim, res in attention_resolutions, dropout)
+            for i_c, o_c, res in zip(dec_in, dec_out, dec_resolutions)
+        ])
 
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
-            nn.ReLU()
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
         )
-        self.output = nn.Conv2d(32, output_shape[0], kernel_size = 1, padding=0)
-        # self.final_activation = nn.Sigmoid()
+        if num_attributes > 0:
+            self.label_mlp = nn.Sequential(
+                nn.Linear(num_attributes, time_emb_dim),
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, time_emb_dim),
+            )
+            self.null_cond = nn.Parameter(torch.zeros(time_emb_dim))
 
-    def forward(self, x, timestep):
+        self.out_norm = norm_layer(self.channels[0])
+        self.out_activation = nn.SiLU()
+        # No output activation: the target is noise ~ N(0, 1), which is signed and unbounded.
+        self.output = nn.Conv2d(self.channels[0], output_shape[0], kernel_size=1)
+        # Zero-init so the model starts by predicting zero noise, which stabilises early training.
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def _conditioning(self, attributes, batch, cond_drop_prob, device):
+        null_cond = self.null_cond[None, :].expand(batch, -1)
+        if attributes is None:
+            return null_cond
+        cond = self.label_mlp(attributes)
+        if cond_drop_prob > 0:
+            drop = torch.rand(batch, device=device) < cond_drop_prob
+            cond = torch.where(drop[:, None], null_cond.to(cond.dtype), cond)
+        return cond
+
+    def forward(self, x, timestep, attributes=None, cond_drop_prob=0.0):
         t = self.time_mlp(timestep)
-        intermediate_values = []
-        for encoder, attention in zip(self.encoder_list, self.attention_list):
-            x, i = encoder(x, t)
-            x = attention(x)
-            intermediate_values.append(i)
+        if self.num_attributes > 0:
+            t = t + self._conditioning(attributes, x.shape[0], cond_drop_prob, x.device)
 
-        x = self.bottle_neck(x, t)
+        x = self.stem(x)
 
-        for decoder, skip in zip(self.decoder_list, intermediate_values[::-1]):
+        skips = []
+        for encoder in self.encoder_list:
+            x, skip = encoder(x, t)
+            skips.append(skip)
+
+        x = self.bottleneck_in(x, t)
+        x = self.bottleneck_attention(x)
+        x = self.bottleneck_out(x, t)
+
+        for decoder, skip in zip(self.decoder_list, skips[::-1]):
             x = decoder(x, skip, t)
 
-        x = self.output(x)
+        return self.output(self.out_activation(self.out_norm(x)))
 
-        return x
 
 class Diffusion:
-    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=256, device="cuda"):
+    def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=64,
+                 device="cuda", schedule='cosine'):
         self.noise_steps = noise_steps
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.img_size = img_size
         self.device = device
+        self.schedule = schedule
 
         self.beta = self.prepare_noise_schedule().to(device)
         self.alpha = 1. - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 
     def prepare_noise_schedule(self):
-        return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+        if self.schedule == 'linear':
+            return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+        # Cosine schedule (Nichol & Dhariwal); destroys information more gradually than
+        # linear, which noticeably helps at low resolutions like 64x64.
+        s = 0.008
+        steps = torch.linspace(0, self.noise_steps, self.noise_steps + 1) / self.noise_steps
+        alphas_cumprod = torch.cos((steps + s) / (1 + s) * math.pi / 2) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return betas.clamp(max=0.999)
 
     def noise_images(self, x, t):
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
@@ -157,23 +250,42 @@ class Diffusion:
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
-    def sample(self, model, n):
+    def sample(self, model, n, attributes=None, seed=None, guidance_scale=1.0):
+        """Generate n images.
+
+        `seed` fixes the noise so runs are reproducible and samples saved at different epochs
+        stay directly comparable. `guidance_scale` > 1 applies classifier-free guidance, pushing
+        samples further towards the requested attributes (typical range 1.5-5).
+        """
         print(f"Sampling {n} new images....")
         model.eval()
+        if attributes is not None:
+            attributes = attributes.to(self.device)
+        use_guidance = attributes is not None and guidance_scale != 1.0
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+
         with torch.no_grad():
-            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+            x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device, generator=generator)
             for i in reversed(range(1, self.noise_steps)):
                 t = (torch.ones(n) * i).long().to(self.device)
-                predicted_noise = model(x, t)
+                if use_guidance:
+                    predicted_noise = model(x, t, attributes)
+                    uncond_noise = model(x, t, None)
+                    predicted_noise = uncond_noise + guidance_scale * (predicted_noise - uncond_noise)
+                else:
+                    predicted_noise = model(x, t, attributes)
                 alpha = self.alpha[t][:, None, None, None]
                 alpha_hat = self.alpha_hat[t][:, None, None, None]
                 beta = self.beta[t][:, None, None, None]
                 if i > 1:
-                    noise = torch.randn_like(x)
+                    noise = torch.randn(x.shape, device=self.device, generator=generator)
                 else:
                     noise = torch.zeros_like(x)
                 x = 1 / torch.sqrt(alpha) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise) + torch.sqrt(beta) * noise
-                if i%100 == 0:
+                if i % 100 == 0:
                     print("=", end="")
         model.train()
         x = (x.clamp(-1, 1) + 1) / 2
@@ -181,16 +293,12 @@ class Diffusion:
         return x
 
 
-
 if __name__ == "__main__":
-    shape = (3, 256, 256)
-    batch = 5
-    # model = DiffusionModel(10)
-    model = UNet(input_shape=shape, output_shape=shape)
-    # input = torch.rand(10, 3, 512, 512)
-    # print("Num params: ", sum(p.numel() for p in model.parameters()))
-    # model = Attention(256, 32, 1)
-    input = torch.rand(batch, 3, 256, 256)
-    t = torch.randint(0, 10, (batch,)).long()
-    pred = model(input, t)
-    print(pred[0].shape, pred[1].shape)
+    shape = (3, 64, 64)
+    batch = 2
+    model = UNet(input_shape=shape, output_shape=shape, num_attributes=10)
+    print("Num params:", sum(p.numel() for p in model.parameters()))
+    x = torch.rand(batch, *shape)
+    t = torch.randint(0, 1000, (batch,)).long()
+    attrs = torch.randint(0, 2, (batch, 10)).float()
+    print("output:", model(x, t, attrs).shape)
