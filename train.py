@@ -13,24 +13,31 @@ from utils import *
 from dataset import SELECTED_ATTRIBUTES, random_attribute_batch
 
 
-def train_worker(rank, world_size, args):
+def train_worker(rank, world_size, args, local_rank=None):
     """Runs the full training loop in one process. With world_size > 1 this is one of several
-    processes spawned by `train()`, each driving its own GPU via DistributedDataParallel --
-    gradients are synchronized (all-reduced) automatically on every backward() call, so this
-    function doesn't need to do anything special for that. Logging, sampling and checkpointing
-    only happen on rank 0 to avoid duplicate work and file-write races between processes.
+    processes (spawned by `train()` or launched by torchrun), each driving its own GPU via
+    DistributedDataParallel -- gradients are synchronized (all-reduced) automatically on every
+    backward() call, so this function doesn't need to do anything special for that. Logging,
+    sampling and checkpointing only happen on rank 0 to avoid duplicate work and file-write
+    races between processes.
+
+    `local_rank` is the GPU index on this machine; it differs from `rank` only in multi-node
+    runs, so it defaults to `rank`.
     """
     is_main = rank == 0
     distributed = world_size > 1
+    if local_rank is None:
+        local_rank = rank
     if distributed:
         os.environ.setdefault('MASTER_ADDR', 'localhost')
         os.environ.setdefault('MASTER_PORT', '12355')
         os.environ.setdefault('USE_LIBUV', '0')  # some torch builds (notably Windows) lack libuv support
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        if not dist.is_initialized():
+            dist.init_process_group(backend, rank=rank, world_size=world_size)
         if torch.cuda.is_available():
-            torch.cuda.set_device(rank)
-            device = torch.device(f'cuda:{rank}')
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
         else:
             device = torch.device('cpu')
     else:
@@ -79,7 +86,7 @@ def train_worker(rank, world_size, args):
         ema.ema_model = ema.ema_model.to(device)
 
     if distributed:
-        model = DDP(model, device_ids=[rank] if device.type == 'cuda' else None)
+        model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None)
         if is_main:
             print(f'Using DistributedDataParallel across {world_size} processes')
 
@@ -186,13 +193,44 @@ def train_worker(rank, world_size, args):
         dist.destroy_process_group()
 
 
+def _running_in_notebook():
+    """True inside a Jupyter/IPython kernel. mp.spawn cannot be used there: the spawn start
+    method re-imports __main__ (which is the kernel, not an importable module) and pickles the
+    args object by reference to __main__, so any class defined in a notebook cell fails to
+    resolve in the child. Children die during startup with a bare non-zero exit code."""
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None and 'IPKernelApp' in get_ipython().config
+    except Exception:
+        return False
+
+
 def train(args):
-    """Entry point. Spawns one process per visible GPU (DistributedDataParallel) when more than
-    one is available; runs directly in-process otherwise (single GPU or CPU), unchanged from
-    before. Set args.distributed = False to force single-process even with multiple GPUs visible.
+    """Entry point, supporting three launch modes:
+
+    1. `torchrun --nproc_per_node=N train.py` -- recommended for multi-GPU. torchrun starts the
+       processes itself and sets RANK/WORLD_SIZE/LOCAL_RANK, so this process is already a worker.
+    2. `python train.py` on a multi-GPU box -- spawns one process per GPU via mp.spawn.
+    3. Single GPU, CPU, or inside a notebook -- runs in-process.
+
+    Set args.distributed = False to force single-process even with multiple GPUs visible.
     """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        train_worker(int(os.environ['RANK']), int(os.environ['WORLD_SIZE']), args,
+                     local_rank=int(os.environ.get('LOCAL_RANK', os.environ['RANK'])))
+        return
+
     world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
     if world_size > 1 and getattr(args, 'distributed', True):
+        if _running_in_notebook():
+            print(f'WARNING: {world_size} GPUs are visible, but multi-GPU training cannot be '
+                  'launched from a notebook (mp.spawn cannot pickle notebook-defined objects '
+                  'or re-import the kernel as __main__). Falling back to a single GPU.\n'
+                  '         To use all GPUs, run training as a script instead:\n'
+                  f'             torchrun --nproc_per_node={world_size} train.py\n'
+                  '         Set args.distributed = False to silence this warning.')
+            train_worker(0, 1, args)
+            return
         mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
     else:
         train_worker(0, 1, args)
