@@ -1,5 +1,6 @@
 import os
 import csv
+import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -13,18 +14,36 @@ SELECTED_ATTRIBUTES = [
 ]
 
 
-# Fixed conditioning combos used for the periodic training previews. Each becomes one image in the
-# saved grid, so a given position always shows the same requested attributes as training progresses.
-EVAL_ATTRIBUTE_SETS = [
-    {"Male": 1, "Young": 1},
-    {"Male": 0, "Young": 1},
-    {"Male": 1, "Young": 1, "Smiling": 1},
-    {"Male": 0, "Young": 1, "Smiling": 1},
-    {"Male": 0, "Young": 1, "Blond_Hair": 1},
-    {"Male": 1, "Young": 1, "Black_Hair": 1},
-    {"Male": 1, "Young": 1, "Eyeglasses": 1},
-    {"Male": 1, "Young": 1, "Mustache": 1, "Goatee": 1},
-]
+# These four are mutually exclusive in reality (a face has one hair state), so random combos
+# below never activate more than one at a time.
+_HAIR_ATTRIBUTES = {"Black_Hair", "Blond_Hair", "Brown_Hair", "Bald"}
+
+
+def random_attribute_batch(n, seed=None):
+    """Generate n random, non-contradictory attribute combos for preview sampling.
+
+    Each sample gets 1-4 randomly chosen attributes set to 1 (at most one hair state among
+    them). Used for periodic training previews so they show the model's general range rather
+    than the same fixed set of faces every time. `seed` makes a given call reproducible without
+    touching the global RNG."""
+    rng = random.Random(seed)
+    rows = []
+    for _ in range(n):
+        k = rng.randint(1, 4)
+        pool = SELECTED_ATTRIBUTES[:]
+        rng.shuffle(pool)
+        chosen = []
+        used_hair = False
+        for name in pool:
+            if len(chosen) >= k:
+                break
+            if name in _HAIR_ATTRIBUTES:
+                if used_hair:
+                    continue
+                used_hair = True
+            chosen.append(name)
+        rows.append({name: 1 for name in chosen})
+    return build_attribute_batch(rows)
 
 
 def build_attribute_vector(requested, n=1):

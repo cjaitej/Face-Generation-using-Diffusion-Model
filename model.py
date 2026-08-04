@@ -325,6 +325,15 @@ class Diffusion:
                 alpha = self.alpha[t][:, None, None, None]
                 alpha_hat = self.alpha_hat[t][:, None, None, None]
                 beta = self.beta[t][:, None, None, None]
+
+                # Clip the implied x0 estimate to the valid data range at every step. The
+                # reconstruction below divides by sqrt(alpha_hat), which is smallest (most
+                # ill-conditioned) at high t -- without this, a prediction error there gets
+                # amplified and compounds multiplicatively over ~1000 sequential steps,
+                # saturating the output instead of converging to an image.
+                x0_pred = ((x - torch.sqrt(1 - alpha_hat) * predicted_noise) / torch.sqrt(alpha_hat)).clamp(-1, 1)
+                predicted_noise = (x - torch.sqrt(alpha_hat) * x0_pred) / torch.sqrt(1 - alpha_hat)
+
                 if i > 1:
                     noise = torch.randn(x.shape, device=self.device, generator=generator)
                 else:

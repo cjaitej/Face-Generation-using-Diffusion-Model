@@ -6,7 +6,7 @@ import torch.nn as nn
 import argparse
 from tqdm import tqdm
 from utils import *
-from dataset import SELECTED_ATTRIBUTES, EVAL_ATTRIBUTE_SETS, build_attribute_batch
+from dataset import SELECTED_ATTRIBUTES, random_attribute_batch
 
 
 def train(args):
@@ -64,17 +64,13 @@ def train(args):
     # This is what makes classifier-free guidance possible at sampling time.
     cond_drop_prob = getattr(args, 'cond_drop_prob', 0.1) if num_attributes else 0.0
 
-    # Same attribute combos + same noise seed every time, so the saved grids form a directly
-    # comparable epoch-by-epoch progression rather than unrelated random faces.
+    # Attribute combos + noise are freshly randomized each preview (seeded off the epoch number,
+    # so a given epoch is reproducible across runs) -- shows the model's general range instead of
+    # tracking the same fixed set of faces every time.
     sample_every = getattr(args, 'sample_every', 5)
     sample_seed = getattr(args, 'sample_seed', 1234)
     guidance_scale = getattr(args, 'guidance_scale', 3.0)
-    if num_attributes:
-        eval_attributes = build_attribute_batch(EVAL_ATTRIBUTE_SETS).to(device)
-        n_eval = eval_attributes.shape[0]
-    else:
-        eval_attributes = None
-        n_eval = len(EVAL_ATTRIBUTE_SETS)
+    n_eval = getattr(args, 'n_eval_samples', 8)
 
     for epoch in range(start_epoch, args.epochs):
         running_loss = 0.0
@@ -108,8 +104,10 @@ def train(args):
 
         if epoch % sample_every == 0:
             sampling_model = ema.ema_model if ema is not None else unwrap(model)
+            epoch_seed = sample_seed + epoch
+            eval_attributes = random_attribute_batch(n_eval, seed=epoch_seed).to(device) if num_attributes else None
             sampled_images = diffusion.sample(sampling_model, n=n_eval, attributes=eval_attributes,
-                                              seed=sample_seed, guidance_scale=guidance_scale)
+                                              seed=epoch_seed, guidance_scale=guidance_scale)
             sample_path = os.path.join("results", args.run_name, f"epoch_{epoch:04d}.jpg")
             save_images(sampled_images, sample_path)
             print(f"Saved samples to {sample_path}")
@@ -145,5 +143,6 @@ if __name__ == "__main__":
     args.cond_drop_prob = 0.1      # classifier-free guidance conditioning dropout
     args.guidance_scale = 3.0      # guidance strength used for the preview grids
     args.sample_every = 5          # save a preview grid every N epochs
-    args.sample_seed = 1234        # fixed noise so grids are comparable across epochs
+    args.sample_seed = 1234        # base seed for preview randomization (offset by epoch)
+    args.n_eval_samples = 8        # number of randomized faces per preview grid
     train(args)
