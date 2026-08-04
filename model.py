@@ -295,6 +295,14 @@ class Diffusion:
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
+    def min_snr_weights(self, t, gamma=5.0):
+        """Min-SNR-gamma loss weighting (Hang et al., ICCV 2023). Downweights low-noise/
+        high-SNR timesteps, which have a hard floor on achievable loss (recovering the exact
+        noise draw from an almost-clean image is bounded by the image's own pixel-level
+        randomness) and so would otherwise dominate the gradient without much to show for it."""
+        snr = self.alpha_hat[t] / (1 - self.alpha_hat[t])
+        return torch.clamp(snr, max=gamma) / snr
+
     def sample(self, model, n, attributes=None, seed=None, guidance_scale=1.0):
         """Generate n images.
 

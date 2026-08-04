@@ -51,10 +51,11 @@ def train(args):
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
-    mse = nn.MSELoss()
+    mse = nn.MSELoss(reduction='none')
     diffusion = Diffusion(noise_steps=getattr(args, 'noise_steps', 1000),
                           img_size=args.image_size, device=device,
                           schedule=getattr(args, 'schedule', 'cosine'))
+    min_snr_gamma = getattr(args, 'min_snr_gamma', 5.0)
 
     use_amp = getattr(args, 'use_amp', False) and device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -88,7 +89,8 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=use_amp):
                 predicted_noise = model(x_t, t, attributes, cond_drop_prob)
-                loss = mse(noise, predicted_noise)
+                per_sample_loss = mse(noise, predicted_noise).mean(dim=[1, 2, 3])
+                loss = (diffusion.min_snr_weights(t, min_snr_gamma) * per_sample_loss).mean()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -138,6 +140,7 @@ if __name__ == "__main__":
     args.time_emb_dim = 256
     args.dropout = 0.0
     args.schedule = "cosine"       # or "linear" for the original schedule
+    args.min_snr_gamma = 5.0       # Min-SNR-gamma loss weighting clip (Hang et al., 2023)
     args.use_ema = True
     args.ema_decay = 0.999
     args.cond_drop_prob = 0.1      # classifier-free guidance conditioning dropout
