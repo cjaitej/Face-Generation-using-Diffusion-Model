@@ -12,6 +12,11 @@ from dataset import SELECTED_ATTRIBUTES, random_attribute_batch
 def train(args):
     setup_logging(args.run_name)
     device = torch.device(args.device)
+    if device.type == 'cuda':
+        # Every step uses the same fixed input shape (image size, batch size), so cuDNN can
+        # safely benchmark and cache the fastest conv algorithm for it instead of picking a
+        # generic one each time -- essentially free speedup for this training loop's static shapes.
+        torch.backends.cudnn.benchmark = True
     dataloader = get_data(args)
     num_attributes = len(SELECTED_ATTRIBUTES) if getattr(args, 'attr_file', None) else 0
 
@@ -98,8 +103,10 @@ def train(args):
             if ema is not None:
                 ema.update(model)
 
-            running_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{running_loss / (i + 1):.4f}")
+            loss_value = loss.item()  # one CUDA sync per step instead of two
+            running_loss += loss_value
+            pbar.set_postfix(loss=f"{loss_value:.6f}", avg=f"{running_loss / (i + 1):.4f}",
+                            lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         pbar.close()
         print(f"epoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
