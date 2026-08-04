@@ -240,22 +240,25 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.run_name = "FaceForge_Conditional"
     args.epochs = 1001
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
     # Per-process batch size under DistributedDataParallel (each GPU gets this many images per
     # step, not the total across GPUs) -- unlike the old DataParallel setup, you don't need to
     # multiply this by the GPU count yourself.
-    args.batch_size = 32
+    args.batch_size = 512
     args.image_size = 128
     args.center_crop = 178         # CelebA is 178x218; crop square before resizing
     args.random_flip = True
-    args.num_workers = 4
+    args.num_workers =16
     args.pin_memory = torch.cuda.is_available()
     args.dataset_path = "data_set.txt"
     args.samples_per_epoch = None  # e.g. 60000: cap per-epoch batches, redrawn randomly each epoch
     args.attr_file = "list_attr_celeba.csv"  # set to None to train the original unconditional model
     args.device = "cuda" if torch.cuda.is_available() else "cpu"
     args.lr = 1e-4
-    args.resume_checkpoint = None  # set to a checkpoint path to resume training
-    args.checkpoint_path = "checkpoint.pth.tar"
+    RESUME_CHECKPOINT = './models/faceforge_checkpoint.pth.tar'
+    args.resume_checkpoint = RESUME_CHECKPOINT
+    args.checkpoint_path = './models/faceforge_checkpoint.pth.tar'
     args.use_amp = torch.cuda.is_available()
     args.noise_steps = 1000
     args.time_emb_dim = 256
