@@ -352,6 +352,52 @@ class Diffusion:
         x = (x * 255).type(torch.uint8)
         return x
 
+    def sample_ddim(self, model, n, attributes=None, seed=None, guidance_scale=1.0, ddim_steps=50):
+        """Generate n images with DDIM (Song et al., 2021) instead of full ancestral sampling.
+
+        Deterministic (eta=0) and walks a strided subsequence of `ddim_steps` timesteps instead
+        of all `noise_steps`, which is ~(noise_steps / ddim_steps)x faster for very similar
+        quality -- meant for interactive use where the full 1000-step loop is too slow to wait on.
+        """
+        model.eval()
+        if attributes is not None:
+            attributes = attributes.to(self.device)
+        use_guidance = attributes is not None and guidance_scale != 1.0
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        steps = torch.linspace(1, self.noise_steps - 1, min(ddim_steps, self.noise_steps - 1))
+        steps = sorted(set(steps.long().tolist()), reverse=True)
+
+        with torch.no_grad():
+            x = torch.randn((n, 3, self.img_size, self.img_size), device=self.device, generator=generator)
+            for idx, i in enumerate(tqdm(steps, desc=f"sampling {n} images (DDIM, {len(steps)} steps)",
+                                         dynamic_ncols=True, leave=False)):
+                t = (torch.ones(n) * i).long().to(self.device)
+                if use_guidance:
+                    predicted_noise = model(x, t, attributes)
+                    uncond_noise = model(x, t, None)
+                    predicted_noise = uncond_noise + guidance_scale * (predicted_noise - uncond_noise)
+                else:
+                    predicted_noise = model(x, t, attributes)
+
+                alpha_hat = self.alpha_hat[t][:, None, None, None]
+                i_prev = steps[idx + 1] if idx + 1 < len(steps) else 0
+                alpha_hat_prev = self.alpha_hat[i_prev] if i_prev > 0 else torch.tensor(1.0, device=self.device)
+
+                # Same clipping safeguard as the ancestral sampler: reconstruct x0, clip it to
+                # the valid data range, then step using the eps consistent with that clipped x0.
+                x0_pred = ((x - torch.sqrt(1 - alpha_hat) * predicted_noise) / torch.sqrt(alpha_hat)).clamp(-1, 1)
+                predicted_noise = (x - torch.sqrt(alpha_hat) * x0_pred) / torch.sqrt(1 - alpha_hat)
+
+                x = torch.sqrt(alpha_hat_prev) * x0_pred + torch.sqrt(1 - alpha_hat_prev) * predicted_noise
+        model.train()
+        x = (x.clamp(-1, 1) + 1) / 2
+        x = (x * 255).type(torch.uint8)
+        return x
+
 
 if __name__ == "__main__":
     shape = (3, 64, 64)
