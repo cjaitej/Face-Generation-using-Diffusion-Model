@@ -55,14 +55,12 @@ def train_worker(rank, world_size, args, local_rank=None):
 
     resume_checkpoint = getattr(args, 'resume_checkpoint', None)
     optimizer_state = None
-    scheduler_state = None
     ema_model = None
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
         model = checkpoint['model']
         ema_model = checkpoint.get('ema_model')
         optimizer_state = checkpoint.get('optimizer_state_dict')
-        scheduler_state = checkpoint.get('scheduler_state_dict')
         start_epoch = checkpoint['epoch'] + 1
         if is_main:
             print(f'\nLoaded checkpoint from epoch {start_epoch}.\n')
@@ -94,22 +92,21 @@ def train_worker(rank, world_size, args, local_rank=None):
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
-    # Cosine decay over the full run so resuming with a raised `epochs` target would shift the
-    # decay horizon -- set epochs to the value you actually intend to train to before resuming.
+    # Cosine decay over the full run so resuming with a raised `epochs` target shifts the decay
+    # horizon -- set epochs to the value you actually intend to train to before resuming.
+    #
+    # The LR position is derived from the checkpoint's epoch rather than from any saved scheduler
+    # counter: checkpoints written before this scheduler existed have no counter at all, and ones
+    # written by a run that restarted its decay carry a counter that disagrees with the real
+    # epoch. Replaying from the configured base lr makes the curve a pure function of
+    # (lr, epochs, start_epoch), so a resumed run always lands where an uninterrupted one would.
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = args.lr
+        param_group.pop('initial_lr', None)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    if scheduler_state is not None:
-        scheduler.load_state_dict(scheduler_state)
-        # load_state_dict restores the scheduler's own counters but doesn't push the resumed LR
-        # back into the optimizer -- without this it would silently train the next epoch at the
-        # original (pre-decay) lr until the following scheduler.step() corrected it.
-        for param_group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
-            param_group['lr'] = lr
-    elif start_epoch > 0:
-        # Resuming from a checkpoint saved before the scheduler existed (no scheduler_state_dict).
-        # Without this, the freshly-constructed scheduler would restart its cosine decay from 0
-        # instead of picking up at the real epoch -- fast-forward it to the correct point instead.
+    if start_epoch > 0:
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', UserWarning)  # expected: step() called without an interleaved optimizer.step() here
+            warnings.simplefilter('ignore', UserWarning)  # expected: step() without an interleaved optimizer.step() here
             for _ in range(start_epoch):
                 scheduler.step()
 
@@ -226,8 +223,10 @@ def train(args):
             print(f'WARNING: {world_size} GPUs are visible, but multi-GPU training cannot be '
                   'launched from a notebook (mp.spawn cannot pickle notebook-defined objects '
                   'or re-import the kernel as __main__). Falling back to a single GPU.\n'
-                  '         To use all GPUs, run training as a script instead:\n'
-                  f'             torchrun --nproc_per_node={world_size} train.py\n'
+                  '         To use all GPUs, put this same config in a .py script that calls\n'
+                  '         train(args), then launch it with:\n'
+                  f'             torchrun --nproc_per_node={world_size} your_script.py\n'
+                  '         (batch_size is per-GPU under DDP, so halve it to keep the same total.)\n'
                   '         Set args.distributed = False to silence this warning.')
             train_worker(0, 1, args)
             return
