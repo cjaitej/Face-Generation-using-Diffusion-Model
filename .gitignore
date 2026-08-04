@@ -2,4 +2,3 @@ img_align_celeba
 *.csv
 __pycache__
 data_set.txt
-*.pth.tar
