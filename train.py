@@ -1,5 +1,9 @@
 import os
+import warnings
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from model import Diffusion, UNet
 import torch.optim as optim
 import torch.nn as nn
@@ -9,15 +13,37 @@ from utils import *
 from dataset import SELECTED_ATTRIBUTES, random_attribute_batch
 
 
-def train(args):
-    setup_logging(args.run_name)
-    device = torch.device(args.device)
+def train_worker(rank, world_size, args):
+    """Runs the full training loop in one process. With world_size > 1 this is one of several
+    processes spawned by `train()`, each driving its own GPU via DistributedDataParallel --
+    gradients are synchronized (all-reduced) automatically on every backward() call, so this
+    function doesn't need to do anything special for that. Logging, sampling and checkpointing
+    only happen on rank 0 to avoid duplicate work and file-write races between processes.
+    """
+    is_main = rank == 0
+    distributed = world_size > 1
+    if distributed:
+        os.environ.setdefault('MASTER_ADDR', 'localhost')
+        os.environ.setdefault('MASTER_PORT', '12355')
+        os.environ.setdefault('USE_LIBUV', '0')  # some torch builds (notably Windows) lack libuv support
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
+            device = torch.device(f'cuda:{rank}')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+
+    if is_main:
+        setup_logging(args.run_name)
     if device.type == 'cuda':
         # Every step uses the same fixed input shape (image size, batch size), so cuDNN can
         # safely benchmark and cache the fastest conv algorithm for it instead of picking a
         # generic one each time -- essentially free speedup for this training loop's static shapes.
         torch.backends.cudnn.benchmark = True
-    dataloader = get_data(args)
+    dataloader = get_data(args, rank=rank, world_size=world_size)
     num_attributes = len(SELECTED_ATTRIBUTES) if getattr(args, 'attr_file', None) else 0
 
     resume_checkpoint = getattr(args, 'resume_checkpoint', None)
@@ -31,7 +57,8 @@ def train(args):
         optimizer_state = checkpoint.get('optimizer_state_dict')
         scheduler_state = checkpoint.get('scheduler_state_dict')
         start_epoch = checkpoint['epoch'] + 1
-        print(f'\nLoaded checkpoint from epoch {start_epoch}.\n')
+        if is_main:
+            print(f'\nLoaded checkpoint from epoch {start_epoch}.\n')
     else:
         model = UNet(input_shape=(3, args.image_size, args.image_size),
                      output_shape=(3, args.image_size, args.image_size),
@@ -41,7 +68,8 @@ def train(args):
         start_epoch = 0
 
     model = model.to(device)
-    print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
+    if is_main:
+        print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
 
     ema = None
     if getattr(args, 'use_ema', True):
@@ -50,9 +78,10 @@ def train(args):
             ema.ema_model = ema_model
         ema.ema_model = ema.ema_model.to(device)
 
-    if device.type == 'cuda' and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-        print(f'Using DataParallel across {torch.cuda.device_count()} GPUs')
+    if distributed:
+        model = DDP(model, device_ids=[rank] if device.type == 'cuda' else None)
+        if is_main:
+            print(f'Using DistributedDataParallel across {world_size} processes')
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     if optimizer_state is not None:
@@ -68,6 +97,14 @@ def train(args):
         # original (pre-decay) lr until the following scheduler.step() corrected it.
         for param_group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
             param_group['lr'] = lr
+    elif start_epoch > 0:
+        # Resuming from a checkpoint saved before the scheduler existed (no scheduler_state_dict).
+        # Without this, the freshly-constructed scheduler would restart its cosine decay from 0
+        # instead of picking up at the real epoch -- fast-forward it to the correct point instead.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)  # expected: step() called without an interleaved optimizer.step() here
+            for _ in range(start_epoch):
+                scheduler.step()
 
     mse = nn.MSELoss(reduction='none')
     diffusion = Diffusion(noise_steps=getattr(args, 'noise_steps', 1000),
@@ -92,9 +129,11 @@ def train(args):
     n_eval = getattr(args, 'n_eval_samples', 8)
 
     for epoch in range(start_epoch, args.epochs):
+        if hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
         running_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"epoch {epoch}/{args.epochs - 1}", dynamic_ncols=True)
-        for i, batch in enumerate(pbar):
+        iterator = tqdm(dataloader, desc=f"epoch {epoch}/{args.epochs - 1}", dynamic_ncols=True) if is_main else dataloader
+        for i, batch in enumerate(iterator):
             if num_attributes:
                 images, attributes = batch
                 attributes = attributes.to(device)
@@ -116,27 +155,47 @@ def train(args):
             if ema is not None:
                 ema.update(model)
 
-            loss_value = loss.item()  # one CUDA sync per step instead of two
-            running_loss += loss_value
-            pbar.set_postfix(loss=f"{loss_value:.6f}", avg=f"{running_loss / (i + 1):.4f}",
-                            lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            if is_main:
+                loss_value = loss.item()  # one CUDA sync per step instead of two
+                running_loss += loss_value
+                iterator.set_postfix(loss=f"{loss_value:.6f}", avg=f"{running_loss / (i + 1):.4f}",
+                                     lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
-        pbar.close()
         scheduler.step()
-        print(f"epoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
+        if is_main:
+            iterator.close()
+            print(f"epoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
 
-        if epoch % sample_every == 0:
-            sampling_model = ema.ema_model if ema is not None else unwrap(model)
-            epoch_seed = sample_seed + epoch
-            eval_attributes = random_attribute_batch(n_eval, seed=epoch_seed).to(device) if num_attributes else None
-            sampled_images = diffusion.sample(sampling_model, n=n_eval, attributes=eval_attributes,
-                                              seed=epoch_seed, guidance_scale=guidance_scale)
-            sample_path = os.path.join("results", args.run_name, f"epoch_{epoch:04d}.jpg")
-            save_images(sampled_images, sample_path)
-            print(f"Saved samples to {sample_path}")
-        save_checkpoint(epoch, model, optimizer, filename=checkpoint_path, ema=ema,
-                        image_size=args.image_size, schedule=getattr(args, 'schedule', 'cosine'),
-                        scheduler=scheduler)
+            if epoch % sample_every == 0:
+                sampling_model = ema.ema_model if ema is not None else unwrap(model)
+                epoch_seed = sample_seed + epoch
+                eval_attributes = random_attribute_batch(n_eval, seed=epoch_seed).to(device) if num_attributes else None
+                sampled_images = diffusion.sample(sampling_model, n=n_eval, attributes=eval_attributes,
+                                                  seed=epoch_seed, guidance_scale=guidance_scale)
+                sample_path = os.path.join("results", args.run_name, f"epoch_{epoch:04d}.jpg")
+                save_images(sampled_images, sample_path)
+                print(f"Saved samples to {sample_path}")
+            save_checkpoint(epoch, model, optimizer, filename=checkpoint_path, ema=ema,
+                            image_size=args.image_size, schedule=getattr(args, 'schedule', 'cosine'),
+                            scheduler=scheduler)
+
+        if distributed:
+            dist.barrier()  # keep ranks aligned at the epoch boundary while rank 0 samples/saves
+
+    if distributed:
+        dist.destroy_process_group()
+
+
+def train(args):
+    """Entry point. Spawns one process per visible GPU (DistributedDataParallel) when more than
+    one is available; runs directly in-process otherwise (single GPU or CPU), unchanged from
+    before. Set args.distributed = False to force single-process even with multiple GPUs visible.
+    """
+    world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if world_size > 1 and getattr(args, 'distributed', True):
+        mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        train_worker(0, 1, args)
 
 
 if __name__ == "__main__":
@@ -144,6 +203,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.run_name = "FaceForge_Conditional"
     args.epochs = 1001
+    # Per-process batch size under DistributedDataParallel (each GPU gets this many images per
+    # step, not the total across GPUs) -- unlike the old DataParallel setup, you don't need to
+    # multiply this by the GPU count yourself.
     args.batch_size = 32
     args.image_size = 128
     args.center_crop = 178         # CelebA is 178x218; crop square before resizing
@@ -170,4 +232,5 @@ if __name__ == "__main__":
     args.sample_every = 5          # save a preview grid every N epochs
     args.sample_seed = 1234        # base seed for preview randomization (offset by epoch)
     args.n_eval_samples = 8        # number of randomized faces per preview grid
+    args.distributed = True        # set False to force single-process even with multiple GPUs visible
     train(args)

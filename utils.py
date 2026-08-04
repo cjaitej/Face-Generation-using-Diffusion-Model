@@ -6,7 +6,8 @@ import torch.nn as nn
 import torchvision
 from PIL import Image
 from matplotlib import pyplot as plt
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, Sampler
+from torch.nn.parallel import DistributedDataParallel
 from dataset import FaceDataset
 
 
@@ -25,7 +26,41 @@ def save_images(images, path, **kwargs):
     im.save(path)
 
 
-def get_data(args):
+class DistributedRandomSampler(Sampler):
+    """Like torch's DistributedSampler, but supports capping to a random `num_samples`-sized
+    subset of the dataset per epoch (matching the single-process samples_per_epoch behavior)
+    instead of always partitioning the full dataset.
+
+    Every rank derives the same epoch-seeded random pool independently (no communication
+    needed) and then takes a disjoint stride-based slice of it, so ranks never process
+    overlapping samples. Call `set_epoch(epoch)` before each epoch so the pool -- and each
+    rank's shard of it -- changes every epoch instead of repeating.
+    """
+
+    def __init__(self, dataset, num_replicas, rank, num_samples=None, seed=0):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        total = num_samples if num_samples else len(dataset)
+        self.num_samples = total // num_replicas  # drop the remainder so every rank's shard matches
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        pool_size = self.num_samples * self.num_replicas
+        pool = torch.randperm(len(self.dataset), generator=generator)[:pool_size].tolist()
+        return iter(pool[self.rank:pool_size:self.num_replicas])
+
+    def __len__(self):
+        return self.num_samples
+
+
+def get_data(args, rank=0, world_size=1):
     # CelebA aligned images are 178x218. Resizing straight to a square squashes every face
     # vertically by ~22%, so centre-crop to a square first. 178 keeps the full width with a
     # minimal crop; smaller values (e.g. 148) zoom in on the face and drop more background.
@@ -45,7 +80,15 @@ def get_data(args):
     dataset = FaceDataset(args.dataset_path, transforms, attr_file=getattr(args, 'attr_file', None))
 
     samples_per_epoch = getattr(args, 'samples_per_epoch', None)
-    if samples_per_epoch and samples_per_epoch < len(dataset):
+    if world_size > 1:
+        num_samples = samples_per_epoch if (samples_per_epoch and samples_per_epoch < len(dataset)) else None
+        sampler = DistributedRandomSampler(dataset, num_replicas=world_size, rank=rank,
+                                           num_samples=num_samples, seed=getattr(args, 'sample_seed', 0))
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                                num_workers=getattr(args, 'num_workers', 0),
+                                pin_memory=getattr(args, 'pin_memory', False),
+                                drop_last=True)
+    elif samples_per_epoch and samples_per_epoch < len(dataset):
         # RandomSampler re-permutes on every __iter__ (i.e. every epoch, since DataLoader creates
         # a fresh iterator each time), so this draws a *different* random subset each epoch rather
         # than shuffling the same fixed slice forever. Caps per-epoch compute at samples_per_epoch
@@ -64,8 +107,9 @@ def get_data(args):
 
 
 def unwrap(model):
-    """Return the underlying module, stripping the DataParallel wrapper if present."""
-    return model.module if isinstance(model, nn.DataParallel) else model
+    """Return the underlying module, stripping the DataParallel/DistributedDataParallel wrapper
+    if present."""
+    return model.module if isinstance(model, (nn.DataParallel, DistributedDataParallel)) else model
 
 
 class EMA:
