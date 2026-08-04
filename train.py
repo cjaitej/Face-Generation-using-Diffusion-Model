@@ -22,12 +22,14 @@ def train(args):
 
     resume_checkpoint = getattr(args, 'resume_checkpoint', None)
     optimizer_state = None
+    scheduler_state = None
     ema_model = None
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         checkpoint = torch.load(resume_checkpoint, map_location=device, weights_only=False)
         model = checkpoint['model']
         ema_model = checkpoint.get('ema_model')
         optimizer_state = checkpoint.get('optimizer_state_dict')
+        scheduler_state = checkpoint.get('scheduler_state_dict')
         start_epoch = checkpoint['epoch'] + 1
         print(f'\nLoaded checkpoint from epoch {start_epoch}.\n')
     else:
@@ -55,6 +57,17 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
+
+    # Cosine decay over the full run so resuming with a raised `epochs` target would shift the
+    # decay horizon -- set epochs to the value you actually intend to train to before resuming.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    if scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+        # load_state_dict restores the scheduler's own counters but doesn't push the resumed LR
+        # back into the optimizer -- without this it would silently train the next epoch at the
+        # original (pre-decay) lr until the following scheduler.step() corrected it.
+        for param_group, lr in zip(optimizer.param_groups, scheduler.get_last_lr()):
+            param_group['lr'] = lr
 
     mse = nn.MSELoss(reduction='none')
     diffusion = Diffusion(noise_steps=getattr(args, 'noise_steps', 1000),
@@ -109,6 +122,7 @@ def train(args):
                             lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         pbar.close()
+        scheduler.step()
         print(f"epoch {epoch} avg loss: {running_loss / max(len(dataloader), 1):.4f}")
 
         if epoch % sample_every == 0:
@@ -121,7 +135,8 @@ def train(args):
             save_images(sampled_images, sample_path)
             print(f"Saved samples to {sample_path}")
         save_checkpoint(epoch, model, optimizer, filename=checkpoint_path, ema=ema,
-                        image_size=args.image_size, schedule=getattr(args, 'schedule', 'cosine'))
+                        image_size=args.image_size, schedule=getattr(args, 'schedule', 'cosine'),
+                        scheduler=scheduler)
 
 
 if __name__ == "__main__":

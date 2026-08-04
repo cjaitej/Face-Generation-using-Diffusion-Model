@@ -142,7 +142,7 @@ def setup_logging(run_name):
 
 
 def save_checkpoint(epoch, model, optimizer, filename='checkpoint.pth.tar', ema=None,
-                    image_size=None, schedule=None):
+                    image_size=None, schedule=None, scheduler=None):
     state = {'epoch': epoch,
              'model': unwrap(model),
              'optimizer_state_dict': optimizer.state_dict(),
@@ -151,4 +151,6 @@ def save_checkpoint(epoch, model, optimizer, filename='checkpoint.pth.tar', ema=
              'schedule': schedule}
     if ema is not None:
         state['ema_model'] = ema.ema_model
+    if scheduler is not None:
+        state['scheduler_state_dict'] = scheduler.state_dict()
     torch.save(state, filename)
