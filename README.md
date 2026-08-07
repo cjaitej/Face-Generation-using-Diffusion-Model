@@ -48,7 +48,6 @@ the floor a perfect generator could not beat:
 |---|---|---|
 | 512 | 41.11 | 0.00011 |
 | 2048 | 14.07 | −0.00000 |
-| 5000 | 6.01 | 0.00007 |
 
 So of the model's FID 108.95 at N=512, roughly 41 points are the sample-count floor. The
 remaining gap is real, though — **KID tells the cleaner story**: it is an unbiased estimator, and
