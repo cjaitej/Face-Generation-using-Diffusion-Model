@@ -1,0 +1,14 @@
+# Serving dependencies only -- deliberately NOT the training set.
+#
+# The CPU wheel index matters: the default PyPI torch wheel bundles CUDA libraries and is ~2.5GB,
+# which would dominate the image for no benefit on a CPU App Service plan. The CPU build is ~200MB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.6.0
+gradio==6.22.0
+pillow
+numpy
+tqdm
+
+# torchvision is intentionally absent: app.py needs only model.py and dataset.py, and neither
+# imports it. (utils.py does, but that is training-only.)

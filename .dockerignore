@@ -1,0 +1,31 @@
+# Keep the build context small. Without this, Docker uploads the CelebA images (~1.4GB) and the
+# 341MB training checkpoints to the daemon on every build, even though the image never uses them.
+img_align_celeba/
+data_set.txt
+list_attr_celeba.csv
+
+# Training checkpoints. Only models/faceforge_serving.pt (the 85MB export) is copied in, and the
+# Dockerfile names it explicitly.
+models/*.pth.tar
+
+results/
+*.jpg
+*.png
+*.log
+
+# Training-only code -- not imported by app.py.
+train.py
+train_ddp.py
+predict.py
+metrics.py
+utils.py
+create_data_list.py
+*.ipynb
+
+.git/
+.github/
+__pycache__/
+*.pyc
+.venv/
+venv/
+README.md

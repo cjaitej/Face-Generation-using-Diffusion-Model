@@ -1,10 +1,15 @@
+import os
+
 import torch
 import gradio as gr
 
 from model import Diffusion
 from dataset import SELECTED_ATTRIBUTES, build_attribute_vector
 
-CHECKPOINT_PATH = 'models/faceforge_checkpoint.pth.tar'
+# Prefers the small weights-only export produced by export_model.py (~85MB, no pickled module),
+# falling back to a full training checkpoint (~341MB) for local use. Overridable so a container
+# can point at a mounted volume without a rebuild.
+CHECKPOINT_PATH = os.environ.get('FACEFORGE_CHECKPOINT', 'models/faceforge_serving.pt')
 
 # The model only knows these 10 of CelebA's 40 attributes -- it was never trained with the
 # others, so there is no "requested attribute" beyond this list.
@@ -23,18 +28,22 @@ OTHER_ATTRIBUTES = [a for a in SELECTED_ATTRIBUTES
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 if device.type == 'cpu':
-    print('WARNING: CUDA not available in this Python environment -- running on CPU, which will '
-          'be dramatically slower. If you have a GPU, check that this environment has a CUDA build '
-          'of torch (torch.cuda.is_available() should be True) and that you launched app.py with it.')
+    print('Running on CPU. Fast (DDIM) sampling is usable here -- roughly 45s for 12 images -- '
+          'but full 1000-step sampling takes ~15 minutes and is effectively GPU-only.')
 else:
     print(f'Using GPU: {torch.cuda.get_device_name(0)}')
-checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-# Prefer the EMA weights -- they generate noticeably cleaner samples than the live ones.
-model = (checkpoint.get('ema_model') or checkpoint['model']).to(device).eval()
-image_size = checkpoint.get('image_size') or 128
-schedule = checkpoint.get('schedule') or 'cosine'
+
+bundle = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+if 'state_dict' in bundle:  # weights-only export from export_model.py
+    from export_model import load_model
+    model, bundle = load_model(CHECKPOINT_PATH, device=device)
+else:                        # full training checkpoint; EMA weights sample cleaner
+    model = (bundle.get('ema_model') or bundle['model']).to(device).eval()
+image_size = bundle.get('image_size') or 128
+schedule = bundle.get('schedule') or 'cosine'
+epoch = bundle.get('epoch')
 diffusion = Diffusion(img_size=image_size, device=device, schedule=schedule)
-print(f'Loaded checkpoint epoch {checkpoint["epoch"]} | {image_size}x{image_size} | {schedule} schedule '
+print(f'Loaded {CHECKPOINT_PATH} | epoch {epoch} | {image_size}x{image_size} | {schedule} schedule '
       f'| conditional={bool(model.num_attributes)}')
 
 
@@ -64,7 +73,7 @@ def generate(gender, age, hair, other_attrs, num_images, guidance_scale, seed, m
 with gr.Blocks(title='FaceForge') as demo:
     gr.Markdown(
         '# FaceForge — Conditional Face Generator\n'
-        f'Checkpoint epoch {checkpoint["epoch"]}, {image_size}x{image_size}.\n\n'
+        f'Checkpoint epoch {epoch}, {image_size}x{image_size}.\n\n'
         '**Attributes this model supports** (trained on 10 of CelebA\'s 40 attributes — '
         'requesting anything else isn\'t possible without retraining):\n'
         f'- Gender: {", ".join(GENDER_CHOICES)}\n'
@@ -93,4 +102,7 @@ with gr.Blocks(title='FaceForge') as demo:
                        outputs=gallery)
 
 if __name__ == '__main__':
-    demo.launch()
+    # 0.0.0.0 so the container is reachable from outside it -- Gradio's 127.0.0.1 default is
+    # unroutable behind Azure's front end. Azure App Service injects the port to listen on.
+    demo.queue().launch(server_name='0.0.0.0',
+                        server_port=int(os.environ.get('PORT', os.environ.get('WEBSITES_PORT', 7860))))
