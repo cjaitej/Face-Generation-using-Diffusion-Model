@@ -4,6 +4,8 @@ A conditional DDPM trained from scratch on CelebA at 128×128. You pick attribut
 hair colour, glasses, facial hair — and it generates faces matching them, using classifier-free
 guidance to control how strongly the request is enforced.
 
+**Live demo:** [diffusion-app.proudbay-827b9367.centralindia.azurecontainerapps.io](https://diffusion-app.proudbay-827b9367.centralindia.azurecontainerapps.io/)
+
 ![epoch 490](results/FaceForge_Conditional_v2/epoch_0490.jpg)
 
 *Samples at epoch 490. Each image is conditioned on a different randomly-drawn attribute combination.*
